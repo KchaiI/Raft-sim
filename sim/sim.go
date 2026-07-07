@@ -48,6 +48,16 @@ type Options struct {
 	ClientThinkMean int64 // 操作間の平均思考時間 (default 20ms)
 	ClientTimeout   int64 // 再送タイムアウト (default 800ms)
 	Keys            int   // キー空間サイズ (default 5)
+
+	// SnapshotThreshold > 0 なら、apply 済みエントリが前回スナップショットから
+	// この数を超えたときにスナップショットを取りログを圧縮する (M5)。
+	SnapshotThreshold uint64
+
+	// SpareNodes は初期構成に含まれない予備サーバー数 (M6)。
+	// ID は Nodes+1 .. Nodes+SpareNodes。AddServer で投票メンバーに昇格できる。
+	SpareNodes int
+	// MinVoters はチャーン注入が構成を縮小する下限 (default 3)。
+	MinVoters int
 }
 
 func (o *Options) defaults() {
@@ -108,6 +118,7 @@ type Simulator struct {
 	downCount       int
 	events          int
 	proposeSeq      int
+	snapSent        int // 送信された InstallSnapshot の数 (テスト観測用)
 
 	// KV クライアント層 (M4)
 	clients []*Client
@@ -257,6 +268,9 @@ func (s *Simulator) checkInvariants() {
 // ---- メッセージ配送 ----
 
 func (s *Simulator) sendRaftMsg(m raft.Message) {
+	if m.Type == raft.MsgSnap {
+		s.snapSent++
+	}
 	desc := ""
 	if s.tr.Enabled() {
 		desc = fmt.Sprintf("%s term=%d", m.Type, m.Term)
@@ -414,6 +428,9 @@ func (s *Simulator) Leaders() []uint64 {
 
 // Node は検査用にノードを返す (クラッシュ中は nil)。
 func (s *Simulator) Node(id uint64) *raft.Node { return s.servers[id].node }
+
+// SnapshotsSent は送信された InstallSnapshot メッセージ数。
+func (s *Simulator) SnapshotsSent() int { return s.snapSent }
 
 // History はクライアント操作履歴 (線形化可能性検査の入力)。
 func (s *Simulator) History() []checker.LinOp { return s.history }

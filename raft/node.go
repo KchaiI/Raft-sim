@@ -613,8 +613,8 @@ func (n *Node) handleAppResp(m Message) {
 		return
 	}
 	pr.recentActive = true
-	pr.pendingSnap = false
 	if m.Success {
+		pr.pendingSnap = false
 		if m.MatchIndex > pr.match {
 			pr.match = m.MatchIndex
 		}

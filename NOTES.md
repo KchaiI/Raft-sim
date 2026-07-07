@@ -33,6 +33,21 @@ M4 で apply 層が全 EntryNormal を kv.Command としてデコードするよ
 またいで共有される契約なので、途中から導入するアプリ層のデコーダが読める形式に
 最初から揃えておくべきだった (予約 ClientID=0 の Put に変更して解決)。
 
+## M5: InstallSnapshot はチェッカーの増分スキャンも巻き込む
+
+InstallSnapshot でログが丸ごと置き換わると FirstIndex が「前回観測の末尾」を
+飛び越えて進む。増分ログ検査の再開位置をクランプしないと圧縮済み領域を
+EntryAt で引いて nil → 偽の「ログ穴」違反になる。増分チェッカーは
+「観測対象が不連続にジャンプする遷移 (スナップショット・再起動)」を
+必ず列挙して個別に扱うこと。
+
+## M5: 拒否応答で pendingSnap を解除しない
+
+スナップショット送信中に届く古い AppendEntries 拒否 (ハートビートへの拒否の
+重複配送など) で pendingSnap を解除すると、拒否 1 通ごとにスナップショット
+全体を再送してしまう。解除は成功応答 (SnapResp / AppResp success) のみ。
+喪失時の再送は CheckQuorum 周期のリセットが担保する。
+
 ## M1: リーダーの送信エントリはコピー必須
 
 sendAppend でログの backing array をそのまま Message.Entries に載せると、

@@ -263,6 +263,11 @@ func (v *Invariants) checkLogChain(n *raft.Node, t *nodeTrack) {
 			scanFrom = last + 1 // 純粋な truncate (再スキャン不要)
 		}
 	}
+	if scanFrom < first {
+		// スナップショットで first が前回観測の末尾を超えて進んだ場合
+		// (InstallSnapshot によるログ置換)。圧縮済み領域は検査対象外。
+		scanFrom = first
+	}
 
 	for i := scanFrom; i <= last; i++ {
 		e := n.EntryAt(i)

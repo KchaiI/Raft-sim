@@ -63,6 +63,27 @@ func (sv *Server) handleOutput(out raft.Output) {
 		s.applyEntry(sv, e)
 	}
 	sv.traceStateChange()
+	if len(out.Applied) > 0 {
+		sv.maybeSnapshot()
+	}
+}
+
+// maybeSnapshot は apply がしきい値を超えたらスナップショットを取りログを圧縮する。
+// CreateSnapshot の Step は新たな apply を生まないため再帰は 1 段で止まる。
+func (sv *Server) maybeSnapshot() {
+	s := sv.sim
+	th := s.opt.SnapshotThreshold
+	if th == 0 || sv.node == nil {
+		return
+	}
+	if sv.node.LastApplied()-sv.node.SnapIndex() < th {
+		return
+	}
+	idx := sv.node.LastApplied()
+	data := sv.app.Snapshot()
+	s.tr.Logf(s.now, "node %d: snapshot 作成 index=%d", sv.id, idx)
+	out := sv.node.Step(raft.CreateSnapshot{Index: idx, Data: data})
+	sv.handleOutput(out)
 }
 
 func (sv *Server) traceStateChange() {
