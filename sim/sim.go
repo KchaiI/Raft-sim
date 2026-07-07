@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"raftsim/checker"
+	"raftsim/kv"
 	"raftsim/raft"
 	"raftsim/storage"
 )
@@ -41,6 +42,12 @@ type Options struct {
 	// ProposeInterval > 0 なら、その周期でリーダーに不透明ペイロードを提案する
 	// (M2: ログ複製の駆動用。KV クライアントは M4 で別途実装)。
 	ProposeInterval int64
+
+	// KV クライアントワークロード (M4)。Clients > 0 で有効。
+	Clients         int
+	ClientThinkMean int64 // 操作間の平均思考時間 (default 20ms)
+	ClientTimeout   int64 // 再送タイムアウト (default 800ms)
+	Keys            int   // キー空間サイズ (default 5)
 }
 
 func (o *Options) defaults() {
@@ -74,6 +81,15 @@ func (o *Options) defaults() {
 	if o.Faults.MaxDown == 0 {
 		o.Faults.MaxDown = (o.Nodes - 1) / 2
 	}
+	if o.ClientThinkMean == 0 {
+		o.ClientThinkMean = 20 * Millisecond
+	}
+	if o.ClientTimeout == 0 {
+		o.ClientTimeout = 800 * Millisecond
+	}
+	if o.Keys == 0 {
+		o.Keys = 5
+	}
 }
 
 // Simulator は決定論的シミュレータ本体。単一 goroutine で駆動する。
@@ -93,23 +109,36 @@ type Simulator struct {
 	events          int
 	proposeSeq      int
 
+	// KV クライアント層 (M4)
+	clients []*Client
+	history []checker.LinOp
+	// exactly-once 検査: (clientID, seq) が状態を変化させたログ index。
+	// 異なる index で 2 度 fresh apply されたら重複排除の失敗。
+	effectAt map[effectKey]uint64
+
 	violation error
+}
+
+type effectKey struct {
+	client uint64
+	seq    uint64
 }
 
 // New はシミュレータを構築する。
 func New(opt Options) *Simulator {
 	opt.defaults()
 	s := &Simulator{
-		opt: opt,
-		rng: rand.New(rand.NewSource(opt.Seed)),
-		q:   &Queue{},
-		tr:  NewTrace(opt.Trace),
-		inv: checker.NewInvariants(),
+		opt:      opt,
+		rng:      rand.New(rand.NewSource(opt.Seed)),
+		q:        &Queue{},
+		tr:       NewTrace(opt.Trace),
+		inv:      checker.NewInvariants(),
+		effectAt: map[effectKey]uint64{},
 	}
 	s.net = NewNetwork(opt.Net, s.rng, s.q, s.tr)
 	s.servers = make([]*Server, opt.Nodes+1)
 	for id := uint64(1); id <= uint64(opt.Nodes); id++ {
-		sv := &Server{id: id, sim: s, store: storage.New()}
+		sv := &Server{id: id, sim: s, store: storage.New(), app: kv.NewStore(), pending: map[uint64]uint64{}}
 		sv.node = raft.NewNode(s.raftParams(id))
 		sv.tickInterval = s.skewedTick()
 		s.servers[id] = sv
@@ -119,18 +148,23 @@ func New(opt Options) *Simulator {
 	if opt.ProposeInterval > 0 {
 		s.scheduleProposer()
 	}
+	if opt.Clients > 0 {
+		s.setupClients()
+	}
 	return s
 }
 
-// scheduleProposer は周期的にリーダーへ一意なペイロードを提案する (M2 ワークロード)。
+// scheduleProposer は周期的にリーダーへ一意なコマンドを提案する (M2 ワークロード)。
+// ペイロードは予約 ClientID=0 の KV Put (アプリ層でも正しくデコードできる形式)。
 func (s *Simulator) scheduleProposer() {
 	s.q.At(s.now+s.opt.ProposeInterval, func() {
 		for _, id := range s.aliveIDs() {
 			sv := s.servers[id]
 			if sv.node.State() == raft.StateLeader {
 				s.proposeSeq++
-				payload := []byte(fmt.Sprintf("cmd-%d", s.proposeSeq))
-				reply := sv.step(raft.Propose{Data: payload})
+				cmd := kv.Command{ClientID: 0, Seq: uint64(s.proposeSeq), Op: kv.OpPut,
+					Key: "raw", Value: fmt.Sprintf("cmd-%d", s.proposeSeq)}
+				reply := sv.step(raft.Propose{Data: cmd.Encode()})
 				if reply != nil && reply.OK {
 					s.tr.Logf(s.now, "propose to %d: index=%d term=%d", id, reply.Index, reply.Term)
 				}
@@ -195,6 +229,14 @@ func (s *Simulator) Restart(id uint64) { s.restartServer(id) }
 func (s *Simulator) SetPartition(groups map[uint64]int) {
 	s.net.SetPartition(groups)
 	s.partitionActive = groups != nil
+}
+
+// fail はチェッカー以外の検査 (exactly-once 等) の違反を記録する。
+func (s *Simulator) fail(msg string) {
+	if s.violation == nil {
+		s.tr.Logf(s.now, "VIOLATION: %s", msg)
+		s.violation = fmt.Errorf("t=%d: %s", s.now, msg)
+	}
 }
 
 func (s *Simulator) checkInvariants() {
@@ -372,6 +414,14 @@ func (s *Simulator) Leaders() []uint64 {
 
 // Node は検査用にノードを返す (クラッシュ中は nil)。
 func (s *Simulator) Node(id uint64) *raft.Node { return s.servers[id].node }
+
+// History はクライアント操作履歴 (線形化可能性検査の入力)。
+func (s *Simulator) History() []checker.LinOp { return s.history }
+
+// CheckLinearizable は記録された履歴を検査する (Run 後に呼ぶ)。
+func (s *Simulator) CheckLinearizable() error {
+	return checker.CheckLinearizable(s.history)
+}
 
 // M4 以降のフック (KV アプリ) は sim/app.go に実装する。
 func (s *Simulator) onCrash(sv *Server)   { s.appCrash(sv) }

@@ -3,6 +3,7 @@ package sim
 import (
 	"math/rand"
 
+	"raftsim/kv"
 	"raftsim/raft"
 	"raftsim/storage"
 )
@@ -16,6 +17,11 @@ type Server struct {
 	store *storage.Durable
 
 	tickInterval int64 // クロックスキュー適用済み (D-004)
+
+	// KV アプリ (揮発。再起動時はスナップショット + ログ再生で復元)
+	app *kv.Store
+	// apply 時に応答すべきクライアント要求: clientID → seq (揮発)
+	pending map[uint64]uint64
 
 	// トレース用の直前状態
 	lastState raft.StateType
