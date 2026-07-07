@@ -37,6 +37,10 @@ type Options struct {
 	Net            NetParams
 	Faults         FaultOpts
 	MaxEvents      int // 暴走防止 (default 5,000,000)
+
+	// ProposeInterval > 0 なら、その周期でリーダーに不透明ペイロードを提案する
+	// (M2: ログ複製の駆動用。KV クライアントは M4 で別途実装)。
+	ProposeInterval int64
 }
 
 func (o *Options) defaults() {
@@ -87,6 +91,7 @@ type Simulator struct {
 	partitionActive bool
 	downCount       int
 	events          int
+	proposeSeq      int
 
 	violation error
 }
@@ -111,7 +116,29 @@ func New(opt Options) *Simulator {
 		s.scheduleTick(sv)
 	}
 	s.scheduleFaultCtrl()
+	if opt.ProposeInterval > 0 {
+		s.scheduleProposer()
+	}
 	return s
+}
+
+// scheduleProposer は周期的にリーダーへ一意なペイロードを提案する (M2 ワークロード)。
+func (s *Simulator) scheduleProposer() {
+	s.q.At(s.now+s.opt.ProposeInterval, func() {
+		for _, id := range s.aliveIDs() {
+			sv := s.servers[id]
+			if sv.node.State() == raft.StateLeader {
+				s.proposeSeq++
+				payload := []byte(fmt.Sprintf("cmd-%d", s.proposeSeq))
+				reply := sv.step(raft.Propose{Data: payload})
+				if reply != nil && reply.OK {
+					s.tr.Logf(s.now, "propose to %d: index=%d term=%d", id, reply.Index, reply.Term)
+				}
+				break
+			}
+		}
+		s.scheduleProposer()
+	})
 }
 
 func (s *Simulator) skewedTick() int64 {
