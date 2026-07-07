@@ -157,15 +157,23 @@ func (s *Simulator) scheduleTick(sv *Server) {
 }
 
 // Run は horizon まで実行し、最初の不変条件違反を error として返す。
-func (s *Simulator) Run() error {
+func (s *Simulator) Run() error { return s.RunUntil(s.opt.Horizon) }
+
+// RunUntil は仮想時刻 until (horizon が上限) まで実行する。狙い撃ちシナリオが
+// 「実行 → 介入 (Crash/Restart/分断) → 実行」と刻むための部分実行 API。
+func (s *Simulator) RunUntil(until int64) error {
+	if until > s.opt.Horizon {
+		until = s.opt.Horizon
+	}
 	for {
 		if s.violation != nil {
 			return s.violation
 		}
-		t, fn, ok := s.q.Pop()
-		if !ok || t > s.opt.Horizon {
+		t, ok := s.q.PeekTime()
+		if !ok || t > until {
 			return s.violation
 		}
+		_, fn, _ := s.q.Pop()
 		s.events++
 		if s.events > s.opt.MaxEvents {
 			return fmt.Errorf("イベント数が上限 %d を超過 (暴走の疑い)", s.opt.MaxEvents)
@@ -174,6 +182,19 @@ func (s *Simulator) Run() error {
 		fn()
 		s.checkInvariants()
 	}
+}
+
+// Crash はノードを即座にクラッシュさせる (狙い撃ちシナリオ用)。
+// autoRestart=true なら RestartMean 後の再起動を予約する。
+func (s *Simulator) Crash(id uint64, autoRestart bool) { s.crash(id, autoRestart) }
+
+// Restart はクラッシュ中のノードを耐久状態から再起動する。
+func (s *Simulator) Restart(id uint64) { s.restartServer(id) }
+
+// SetPartition はノード→グループ割当で分断を設定する (nil で回復)。
+func (s *Simulator) SetPartition(groups map[uint64]int) {
+	s.net.SetPartition(groups)
+	s.partitionActive = groups != nil
 }
 
 func (s *Simulator) checkInvariants() {

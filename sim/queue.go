@@ -58,5 +58,13 @@ func (q *Queue) Pop() (t int64, fn func(), ok bool) {
 	return e.time, e.fn, true
 }
 
+// PeekTime は次のイベントの時刻を取り出さずに返す。
+func (q *Queue) PeekTime() (int64, bool) {
+	if len(q.h) == 0 {
+		return 0, false
+	}
+	return q.h[0].time, true
+}
+
 // Len は残イベント数。
 func (q *Queue) Len() int { return len(q.h) }
