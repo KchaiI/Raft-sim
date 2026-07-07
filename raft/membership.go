@@ -93,8 +93,9 @@ func (n *Node) transferLeadership(target uint64) {
 	n.transferElapsed = 0
 	n.out.Reply = &ProposeReply{OK: true, Term: n.term}
 	if pr := n.prs[target]; pr != nil && pr.match == n.log.lastIndex() {
+		// transferee は保持したまま: 移譲が完了 (高 term の観測で退位) するか
+		// タイムアウトするまで新規提案を受けない (博士論文 §3.10)
 		n.send(Message{Type: MsgTimeoutNow, To: target, Term: n.term})
-		n.transferee = None
 	} else {
 		n.sendAppend(target)
 	}

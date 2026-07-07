@@ -187,7 +187,11 @@ func (v *Invariants) checkNode(n *raft.Node) {
 	t.commit = n.CommitIndex()
 
 	// 構成の正当性: voters は非空・昇順・重複なし。
-	// 変更は single-server (前回観測から高々1ノードの増減) であること。
+	// single-server change (一度に高々1ノードの増減) はリーダーの連続在任中に
+	// のみ検査する。フォロワーは catch-up 時に 1 バッチで複数の構成エントリを
+	// 受け取る (構成が一気に進む) し、truncate で巻き戻りもするため、
+	// 観測ごとの差分検査は成り立たない。構成エントリの内容自体の一意性は
+	// ログ連鎖マップが保証する。
 	voters := n.ConfigVoters()
 	if len(voters) == 0 {
 		v.violate("構成が空: node %d", id)
@@ -197,9 +201,9 @@ func (v *Invariants) checkNode(n *raft.Node) {
 			v.violate("構成が昇順でない/重複: node %d %v", id, voters)
 		}
 	}
-	if t.voters != nil && !t.restarted {
+	if n.State() == raft.StateLeader && t.leaderTerm == n.Term() && t.voters != nil && !t.restarted {
 		if d := symmetricDiff(t.voters, voters); d > 1 {
-			v.violate("single-server change 違反: node %d の構成が一度に %d ノード変化 %v → %v", id, d, t.voters, voters)
+			v.violate("single-server change 違反: leader %d の構成が一度に %d ノード変化 %v → %v", id, d, t.voters, voters)
 		}
 	}
 	t.voters = voters

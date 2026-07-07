@@ -23,6 +23,10 @@ type FaultOpts struct {
 	// QuietTail > 0 なら horizon 直前のその期間、新規の障害注入を止め
 	// 分断も強制回復する (収束アサーションを持つテスト用)。
 	QuietTail int64
+	// PConfChange は周期ごとのランダム構成変更 (AddServer/RemoveServer) 確率 (M6)。
+	PConfChange float64
+	// PTransfer は周期ごとのランダムリーダーシップ移譲確率 (M6)。
+	PTransfer float64
 }
 
 // Options はシミュレーション 1 回分の設定。1 シード = 1 宇宙。
@@ -91,6 +95,9 @@ func (o *Options) defaults() {
 	if o.Faults.MaxDown == 0 {
 		o.Faults.MaxDown = (o.Nodes - 1) / 2
 	}
+	if o.MinVoters == 0 {
+		o.MinVoters = 3
+	}
 	if o.ClientThinkMean == 0 {
 		o.ClientThinkMean = 20 * Millisecond
 	}
@@ -147,8 +154,8 @@ func New(opt Options) *Simulator {
 		effectAt: map[effectKey]uint64{},
 	}
 	s.net = NewNetwork(opt.Net, s.rng, s.q, s.tr)
-	s.servers = make([]*Server, opt.Nodes+1)
-	for id := uint64(1); id <= uint64(opt.Nodes); id++ {
+	s.servers = make([]*Server, opt.Nodes+opt.SpareNodes+1)
+	for id := uint64(1); id <= uint64(opt.Nodes+opt.SpareNodes); id++ {
 		sv := &Server{id: id, sim: s, store: storage.New(), app: kv.NewStore(), pending: map[uint64]uint64{}}
 		sv.node = raft.NewNode(s.raftParams(id))
 		sv.tickInterval = s.skewedTick()
@@ -387,6 +394,118 @@ func (s *Simulator) faultCtrlTick() {
 			s.crash(id, true)
 		}
 	}
+	// ランダム構成変更 (M6): AddServer / RemoveServer
+	if f.PConfChange > 0 && s.rng.Float64() < f.PConfChange {
+		s.randomConfChange()
+	}
+	// ランダムリーダーシップ移譲 (M6)
+	if f.PTransfer > 0 && s.rng.Float64() < f.PTransfer {
+		if lead := s.leaderServer(); lead != nil {
+			voters := lead.node.ConfigVoters()
+			cands := make([]uint64, 0, len(voters))
+			for _, v := range voters {
+				if v != lead.id && int(v) < len(s.servers) && s.servers[v].alive() {
+					cands = append(cands, v)
+				}
+			}
+			if len(cands) > 0 {
+				target := cands[s.rng.Intn(len(cands))]
+				s.tr.Logf(s.now, "fault: transfer leadership %d -> %d", lead.id, target)
+				lead.step(raft.TransferLeadership{Target: target})
+			}
+		}
+	}
+}
+
+// leaderServer は生存リーダーのうち最小 ID のものを返す。
+func (s *Simulator) leaderServer() *Server {
+	for id := 1; id < len(s.servers); id++ {
+		sv := s.servers[id]
+		if sv.alive() && sv.node.State() == raft.StateLeader {
+			return sv
+		}
+	}
+	return nil
+}
+
+// randomConfChange はランダムに AddServer / RemoveServer を提案する。
+func (s *Simulator) randomConfChange() {
+	lead := s.leaderServer()
+	if lead == nil {
+		return
+	}
+	voters := lead.node.ConfigVoters()
+	inConfig := map[uint64]bool{}
+	for _, v := range voters {
+		inConfig[v] = true
+	}
+	var nonVoters []uint64
+	for id := 1; id < len(s.servers); id++ {
+		if !inConfig[uint64(id)] && s.servers[id].alive() {
+			nonVoters = append(nonVoters, uint64(id))
+		}
+	}
+	// 50/50 で追加か除去 (可能な方に倒す)
+	tryAdd := s.rng.Float64() < 0.5
+	if tryAdd && len(nonVoters) == 0 {
+		tryAdd = false
+	}
+	if !tryAdd && len(voters) <= s.opt.MinVoters {
+		if len(nonVoters) == 0 {
+			return
+		}
+		tryAdd = true
+	}
+	if tryAdd {
+		id := nonVoters[s.rng.Intn(len(nonVoters))]
+		s.tr.Logf(s.now, "fault: propose AddServer %d", id)
+		lead.step(raft.ProposeConfChange{Change: raft.ConfChange{Type: raft.ConfAddServer, ID: id}})
+	} else {
+		// リーダー自身の除去も含む (博士論文 §4.2.2 のケース)
+		id := voters[s.rng.Intn(len(voters))]
+		s.tr.Logf(s.now, "fault: propose RemoveServer %d", id)
+		lead.step(raft.ProposeConfChange{Change: raft.ConfChange{Type: raft.ConfRemoveServer, ID: id}})
+	}
+}
+
+// ---- 狙い撃ちシナリオ用 API (M6) ----
+
+// ProposeAddServer は現リーダーに AddServer を提案する。
+func (s *Simulator) ProposeAddServer(id uint64) bool {
+	lead := s.leaderServer()
+	if lead == nil {
+		return false
+	}
+	r := lead.step(raft.ProposeConfChange{Change: raft.ConfChange{Type: raft.ConfAddServer, ID: id}})
+	return r != nil && r.OK
+}
+
+// ProposeRemoveServer は現リーダーに RemoveServer を提案する。
+func (s *Simulator) ProposeRemoveServer(id uint64) bool {
+	lead := s.leaderServer()
+	if lead == nil {
+		return false
+	}
+	r := lead.step(raft.ProposeConfChange{Change: raft.ConfChange{Type: raft.ConfRemoveServer, ID: id}})
+	return r != nil && r.OK
+}
+
+// ProposeTransfer は現リーダーにリーダーシップ移譲を指示する。
+func (s *Simulator) ProposeTransfer(target uint64) bool {
+	lead := s.leaderServer()
+	if lead == nil {
+		return false
+	}
+	r := lead.step(raft.TransferLeadership{Target: target})
+	return r != nil && r.OK
+}
+
+// LeaderID は現リーダーの ID (不在なら 0)。
+func (s *Simulator) LeaderID() uint64 {
+	if lead := s.leaderServer(); lead != nil {
+		return lead.id
+	}
+	return 0
 }
 
 func (s *Simulator) aliveIDs() []uint64 {

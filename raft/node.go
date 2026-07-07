@@ -625,10 +625,10 @@ func (n *Node) handleAppResp(m Message) {
 		if n.state != StateLeader {
 			return // maybeCommit → 構成変更適用で退位した可能性 (M6)
 		}
-		// 移譲対象が追いついたら TimeoutNow (博士論文 §3.10)
+		// 移譲対象が追いついたら TimeoutNow (博士論文 §3.10)。
+		// transferee は保持したまま (完了かタイムアウトまで提案を受けない)
 		if n.transferee == m.From && pr.match == n.log.lastIndex() {
 			n.send(Message{Type: MsgTimeoutNow, To: m.From, Term: n.term})
-			n.transferee = None
 		}
 		// 学習者 (catch-up 中の新サーバー) が追いついたら構成変更を発行 (D-010)
 		n.maybePromoteLearner(m.From)
